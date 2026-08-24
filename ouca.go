@@ -112,6 +112,24 @@ func WithMaxRings(r int) Option {
 	}
 }
 
+// WithCacheDir sets the directory of the on-disk tile cache. The cache is
+// shared safely between processes: concurrent writers never corrupt readers.
+// An empty dir selects ~/.cache/ouca (the default).
+func WithCacheDir(dir string) Option {
+	return func(ix *Index) { ix.client.cacheDir = dir }
+}
+
+// WithCacheTTL sets the expiry of cached tiles. Zero selects the default of
+// two weeks; a negative duration disables expiry entirely.
+func WithCacheTTL(ttl time.Duration) Option {
+	return func(ix *Index) { ix.client.cacheTTL = ttl }
+}
+
+// WithoutCache disables the on-disk tile cache.
+func WithoutCache() Option {
+	return func(ix *Index) { ix.client.cacheDisabled = true }
+}
+
 // NewIndex creates a new reverse geocoder and map matcher.
 func NewIndex(opts ...Option) *Index {
 	ix := &Index{
@@ -124,6 +142,7 @@ func NewIndex(opts ...Option) *Index {
 	for _, o := range opts {
 		o(ix)
 	}
+	ix.client.initCache()
 	return ix
 }
 

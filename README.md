@@ -153,11 +153,23 @@ ix := ouca.NewIndex(
 	ouca.WithProvider("https://tiles.openfreemap.org/planet"), // TileJSON URL or {z}/{x}/{y}.pbf template
 	ouca.WithHTTPTimeout(30*time.Second),
 	ouca.WithMaxRings(1), // up to 3x3 tiles searched around the point
+
+	// On-disk tile cache (enabled by default at ~/.cache/ouca).
+	ouca.WithCacheDir("/var/cache/ouca"),   // custom location
+	ouca.WithCacheTTL(7*24*time.Hour),      // expiry; <= 0 disables expiry
+	// ouca.WithoutCache(),                 // or disable it entirely
 )
 ```
 
-The index caches downloaded tiles in memory, so repeated lookups in the same
-area cost no additional network traffic.
+### Tile cache
+
+Downloaded tiles are cached on disk (default `~/.cache/ouca`) and reused
+across runs, so repeated lookups in the same area cost no additional network
+traffic. The cache is designed to be **shared between applications**: every
+tile is written to a temporary file and atomically renamed into place, so
+concurrent writers from separate processes never corrupt a reader — partial
+tiles are impossible and no locks are required. Cache keys are SHA-256 hashes
+of the resolved tile URLs, and entries expire after two weeks by default.
 
 ## Map matching a GPS trace
 
