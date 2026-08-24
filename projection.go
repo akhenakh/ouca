@@ -1,33 +1,44 @@
 package ouca
 
-import "math"
+import (
+	"math"
 
-const (
-	earthRadius   = 6378137.0
-	maxMercator   = earthRadius * math.Pi // 20037508.34...
-	degToRad      = math.Pi / 180
-	defaultExtent = 4096
+	"github.com/peterstace/simplefeatures/carto"
+	"github.com/peterstace/simplefeatures/geom"
 )
 
-// lngToMercatorX converts a longitude in degrees to EPSG:3857 X meters.
-func lngToMercatorX(lng float64) float64 {
-	return lng * degToRad * earthRadius
+// EarthCircumferenceMeters is the WGS84 equatorial circumference.
+const EarthCircumferenceMeters = 40075016.686
+
+const degToRad = math.Pi / 180
+
+const defaultExtent = 4096
+
+// webMercator returns the Web Mercator projection for the given zoom.
+// Coordinates are expressed in global tile units in [0, 2^z], with Y
+// increasing downwards (carto.WebMercator convention).
+func webMercator(z int) *carto.WebMercator {
+	return carto.NewWebMercator(z)
 }
 
-// latToMercatorY converts a latitude in degrees to EPSG:3857 Y meters.
-func latToMercatorY(lat float64) float64 {
-	lat = clamp(lat, -85.05112878, 85.05112878)
-	return math.Log(math.Tan(math.Pi/4+lat*degToRad/2)) * earthRadius
+// metersPerTileAtLat returns the ground size of one tile unit (and thus of a
+// full tile) at the given latitude and zoom. Web Mercator is conformal, so
+// this single scale factor converts tile-unit distances to ground meters
+// around a point.
+func metersPerTileAtLat(lat float64, z int) float64 {
+	return math.Max(math.Cos(lat*degToRad), 1e-9) * EarthCircumferenceMeters / float64(int(1)<<uint(z))
 }
 
-// mercatorXToLng converts EPSG:3857 X meters to longitude degrees.
-func mercatorXToLng(x float64) float64 {
-	return x / earthRadius / degToRad
+// latLngToTileF returns the fractional tile coordinates containing lat/lng.
+func latLngToTileF(wm *carto.WebMercator, lat, lng float64) (xf, yf float64) {
+	p := wm.Forward(geom.XY{X: lng, Y: lat})
+	return p.X, p.Y
 }
 
-// mercatorYToLat converts EPSG:3857 Y meters to latitude degrees.
-func mercatorYToLat(y float64) float64 {
-	return (2*math.Atan(math.Exp(y/earthRadius)) - math.Pi/2) / degToRad
+// tileLatLng converts global tile units back to lat/lng degrees.
+func tileLatLng(wm *carto.WebMercator, x, y float64) (lat, lng float64) {
+	p := wm.Reverse(geom.XY{X: x, Y: y})
+	return p.Y, p.X
 }
 
 func clamp(v, lo, hi float64) float64 {
@@ -40,31 +51,17 @@ func clamp(v, lo, hi float64) float64 {
 	return v
 }
 
-// tileSizeMeters returns the width of a tile in EPSG:3857 meters at zoom z.
-func tileSizeMeters(z int) float64 {
-	return 2 * maxMercator / float64(int(1)<<uint(z))
-}
-
-// latLngToTileF returns the fractional tile coordinates containing lat/lng.
-func latLngToTileF(lat, lng float64, z int) (xf, yf float64) {
-	n := float64(int(1) << uint(z))
-	x := (lng + 180.0) / 360.0 * n
-	y := (1 - math.Log(math.Tan(lat*degToRad)+1/math.Cos(lat*degToRad))/math.Pi) / 2 * n
-	return x, y
-}
-
-// tileToLatLng returns the north-west corner of the given tile.
-func tileToLatLng(x, y int, z int) (lat, lng float64) {
-	n := float64(int(1) << uint(z))
-	lng = float64(x)/n*360.0 - 180.0
-	latRad := math.Atan(math.Sinh(math.Pi * (1 - 2*float64(y)/n)))
-	lat = latRad / degToRad
-	return lat, lng
-}
-
-// mercatorScaleAtLat is the local ground scale factor of Web Mercator.
-// Mercator distances must be multiplied by this factor to get meters on the
-// ground at the given latitude.
-func mercatorScaleAtLat(lat float64) float64 {
-	return math.Max(math.Cos(lat*degToRad), 1e-9)
+// bearingDeg returns the compass bearing of a segment given its start and end
+// points in tile-unit space (Y axis points south).
+func bearingDeg(start, end geom.XY) float64 {
+	dx := end.X - start.X
+	dy := end.Y - start.Y // positive = southwards
+	if dx == 0 && dy == 0 {
+		return 0
+	}
+	b := math.Atan2(dx, -dy) / degToRad
+	if b < 0 {
+		b += 360
+	}
+	return b
 }

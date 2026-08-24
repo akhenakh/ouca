@@ -24,25 +24,26 @@ func isPreferredRoad(r *road) bool {
 	return r.name != "" || r.ref != ""
 }
 
-// bestMatch tracks the closest road to a query point in EPSG:3857 meters.
+// bestMatch tracks the closest road to a query point in global tile units.
 type bestMatch struct {
 	qx, qy float64
 	found  bool
-	meters float64 // mercator meters
+	meters float64 // tile units; multiply by metersPerTileAtLat for ground meters
 	road   *road
 	point  geom.XY // snapped point on the road
 	segStart,
 	segEnd geom.XY // matched segment, for bearing
+	snapIdx int
 }
 
-func newBestMatch(mx, my float64) *bestMatch {
-	return &bestMatch{qx: mx, qy: my}
+func newBestMatch(qx, qy float64) *bestMatch {
+	return &bestMatch{qx: qx, qy: qy}
 }
 
 // search scans roads and updates the current best match.
 func (b *bestMatch) search(roads []*road) {
 	for _, r := range roads {
-		d, p, s0, s1 := closestOnLineString(b.qx, b.qy, r.line)
+		d, p, s0, s1, idx := closestOnLineString(b.qx, b.qy, r.line)
 		if !b.found || d < b.meters {
 			b.found = true
 			b.meters = d
@@ -50,17 +51,20 @@ func (b *bestMatch) search(roads []*road) {
 			b.point = p
 			b.segStart = s0
 			b.segEnd = s1
+			b.snapIdx = idx
 		}
 	}
 }
 
-// closestOnLineString returns the distance from (px,py) to the line string,
-// the closest point, and the segment endpoints containing it.
-func closestOnLineString(px, py float64, ls geom.LineString) (float64, geom.XY, geom.XY, geom.XY) {
+// closestOnLineString returns the distance from (px,py) to the line string in
+// tile units, the closest point, the segment endpoints containing it and the
+// index of the segment's first vertex.
+func closestOnLineString(px, py float64, ls geom.LineString) (float64, geom.XY, geom.XY, geom.XY, int) {
 	seq := ls.Coordinates()
 	n := seq.Length()
 	bestDist := math.MaxFloat64
 	var bestPoint, segA, segB geom.XY
+	bestIdx := -1
 	for i := 0; i+1 < n; i++ {
 		a := seq.GetXY(i)
 		c := seq.GetXY(i + 1)
@@ -70,9 +74,10 @@ func closestOnLineString(px, py float64, ls geom.LineString) (float64, geom.XY, 
 			bestPoint = p
 			segA = a
 			segB = c
+			bestIdx = i
 		}
 	}
-	return bestDist, bestPoint, segA, segB
+	return bestDist, bestPoint, segA, segB, bestIdx
 }
 
 // closestOnSegment returns the closest point on segment a-c to (px,py)
@@ -90,8 +95,8 @@ func closestOnSegment(px, py float64, a, c geom.XY) (geom.XY, float64) {
 	return p, math.Hypot(px-p.X, py-p.Y)
 }
 
-// distToLineString returns the mercator distance from (px,py) to ls.
+// distToLineString returns the distance in tile units from (px,py) to ls.
 func distToLineString(px, py float64, ls geom.LineString) float64 {
-	d, _, _, _ := closestOnLineString(px, py, ls)
+	d, _, _, _, _ := closestOnLineString(px, py, ls)
 	return d
 }

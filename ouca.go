@@ -1,11 +1,12 @@
-// Package ouca provides reverse geocoding against vector tiles: given a
-// latitude/longitude it returns the closest street, its geometry, distance,
-// bearing and the nearest road intersection, which can be used to infer
-// positions.
+// Package ouca provides reverse geocoding and path map-matching against
+// vector tiles: given a latitude/longitude it returns the closest street,
+// its geometry, distance, bearing and the nearest road intersection; given a
+// GPS trace it returns the most likely matched road path (HMM/Viterbi).
 //
 // Tiles are downloaded from an OpenMapTiles-compatible provider (default:
 // https://tiles.openfreemap.org/planet) at zoom level 14 and decoded with
-// mvtgo. All geometric computations use peterstace/simplefeatures.
+// mvtgo. All geometric computations use peterstace/simplefeatures, with the
+// carto.WebMercator projection as the working coordinate space.
 package ouca
 
 import (
@@ -21,7 +22,7 @@ import (
 	"github.com/peterstace/simplefeatures/geom"
 )
 
-// Intersection describes a point where two or more roads meet.
+// Intersection describes a point where two or more named roads meet.
 type Intersection struct {
 	Lat      float64  `json:"lat"`
 	Lng      float64  `json:"lng"`
@@ -32,18 +33,19 @@ type Intersection struct {
 // Address is the closest addressable map element for a position.
 type Address struct {
 	Street       string        `json:"street,omitempty"`
-	Ref          string        `json:"ref,omitempty"`      // road reference number (e.g. A1)
-	Class        string        `json:"class,omitempty"`    // openmaptiles road class
-	Subclass     string        `json:"subclass,omitempty"` // highway subclass
-	Distance     float64       `json:"distance_meters"`    // meters from query to the road
-	Lat          float64       `json:"lat"`                // snapped latitude
-	Lng          float64       `json:"lng"`                // snapped longitude
-	Bearing      float64       `json:"bearing_degrees"`    // bearing of the matched segment
-	RoadsNear    int           `json:"roads_near"`         // number of roads considered nearby
+	Ref          string        `json:"ref,omitempty"`
+	Class        string        `json:"class,omitempty"`
+	Subclass     string        `json:"subclass,omitempty"`
+	Distance     float64       `json:"distance_meters"` // meters from query to the road
+	Lat          float64       `json:"lat"`             // snapped latitude
+	Lng          float64       `json:"lng"`             // snapped longitude
+	Bearing      float64       `json:"bearing_degrees"` // bearing of the matched segment
+	RoadsNear    int           `json:"roads_near"`      // distinct named roads nearby
 	Intersection *Intersection `json:"intersection,omitempty"`
 }
 
-// Index indexes roads decoded from vector tiles for reverse geocoding.
+// Index indexes roads decoded from vector tiles for reverse geocoding and
+// map matching. It is safe for concurrent use.
 type Index struct {
 	zoom    int
 	client  *tileClient
@@ -52,7 +54,7 @@ type Index struct {
 	mu       sync.Mutex
 	resolved bool
 	tiles    map[uint64]*tileData
-	nodes    map[string]*node // intersection candidates keyed by rounded mercator coords
+	nodes    map[string]*node // intersection candidates keyed by rounded tile coords
 }
 
 type tileData struct {
@@ -60,12 +62,15 @@ type tileData struct {
 	roads   []*road
 }
 
+// road is a street geometry in global Web Mercator tile units.
 type road struct {
+	id       uint64
 	name     string
 	ref      string
 	class    string
 	subclass string
-	line     geom.LineString // EPSG:3857 meters
+	oneway   bool
+	line     geom.LineString
 }
 
 type node struct {
@@ -107,7 +112,7 @@ func WithMaxRings(r int) Option {
 	}
 }
 
-// NewIndex creates a new reverse geocoder.
+// NewIndex creates a new reverse geocoder and map matcher.
 func NewIndex(opts ...Option) *Index {
 	ix := &Index{
 		zoom:    DefaultZoom,
@@ -122,29 +127,37 @@ func NewIndex(opts ...Option) *Index {
 	return ix
 }
 
+// resolve ensures the tile URL template has been resolved from the provider
+// TileJSON. Callers must hold ix.mu.
+func (ix *Index) resolve(ctx context.Context) error {
+	if ix.resolved {
+		return nil
+	}
+	if err := ix.client.resolveTileJSON(ctx); err != nil {
+		return err
+	}
+	ix.resolved = true
+	return nil
+}
+
 // Reverse returns the closest address for the given position.
 func (ix *Index) Reverse(ctx context.Context, lat, lng float64) (*Address, error) {
-	if lat < -85.05112878 || lat > 85.05112878 || lng < -180 || lng >= 180 {
-		return nil, fmt.Errorf("lat/lng out of range: %f,%f", lat, lng)
+	if err := validateLatLng(lat, lng); err != nil {
+		return nil, err
 	}
 	ix.mu.Lock()
 	defer ix.mu.Unlock()
-	if !ix.resolved {
-		if err := ix.client.resolveTileJSON(ctx); err != nil {
-			return nil, err
-		}
-		ix.resolved = true
+	if err := ix.resolve(ctx); err != nil {
+		return nil, err
 	}
 
-	mx := lngToMercatorX(lng)
-	my := latToMercatorY(lat)
-	scale := mercatorScaleAtLat(lat)
+	wm := webMercator(ix.zoom)
+	q := wm.Forward(geom.XY{X: lng, Y: lat})
+	mpt := metersPerTileAtLat(lat, ix.zoom)
+	tx, ty := int(math.Floor(q.X)), int(math.Floor(q.Y))
 
-	txf, tyf := latLngToTileF(lat, lng, ix.zoom)
-	tx, ty := int(math.Floor(txf)), int(math.Floor(tyf))
-
-	bestPreferred := newBestMatch(mx, my)
-	bestAny := newBestMatch(mx, my)
+	bestPreferred := newBestMatch(q.X, q.Y)
+	bestAny := newBestMatch(q.X, q.Y)
 	ring := 0
 	const expandThreshold = 250.0 // meters: keep expanding until close enough
 	for {
@@ -158,8 +171,8 @@ func (ix *Index) Reverse(ctx context.Context, lat, lng float64) (*Address, error
 			}
 			bestAny.search([]*road{r})
 		}
-		closeEnough := bestPreferred.found && bestPreferred.meters*scale <= expandThreshold
-		allDone := bestAny.found && bestAny.meters*scale <= expandThreshold && !bestPreferred.found
+		closeEnough := bestPreferred.found && bestPreferred.meters*mpt <= expandThreshold
+		allDone := bestAny.found && bestAny.meters*mpt <= expandThreshold && !bestPreferred.found
 		if closeEnough || allDone || ring >= ix.maxRing {
 			break
 		}
@@ -169,7 +182,7 @@ func (ix *Index) Reverse(ctx context.Context, lat, lng float64) (*Address, error
 	const preferredFallback = 200.0 // meters: max distance at which a preferred road wins
 	var best *bestMatch
 	switch {
-	case bestPreferred.found && bestPreferred.meters*scale <= preferredFallback:
+	case bestPreferred.found && bestPreferred.meters*mpt <= preferredFallback:
 		best = bestPreferred
 	case bestAny.found:
 		best = bestAny
@@ -182,62 +195,110 @@ func (ix *Index) Reverse(ctx context.Context, lat, lng float64) (*Address, error
 	// Street names live in the transportation_name layer; if we matched an
 	// unnamed feature, adopt the name of the closest named duplicate.
 	if best.road.name == "" && best.road.ref == "" {
-		ix.enrichStreetName(best, tx, ty, ring)
+		const maxDonorMeters = 15.0
+		best.road.name, best.road.ref = ix.nearestRoadName(best.point, maxDonorMeters/mpt)
 	}
 
-	snappedLng := mercatorXToLng(best.point.X)
-	snappedLat := mercatorYToLat(best.point.Y)
+	snappedLat, snappedLng := tileLatLng(wm, best.point.X, best.point.Y)
 	addr := &Address{
 		Street:    best.road.name,
 		Ref:       best.road.ref,
 		Class:     best.road.class,
 		Subclass:  best.road.subclass,
-		Distance:  best.meters * scale,
+		Distance:  best.meters * mpt,
 		Lat:       snappedLat,
 		Lng:       snappedLng,
 		Bearing:   bearingDeg(best.segStart, best.segEnd),
-		RoadsNear: ix.countRoadsNear(tx, ty, ring, mx, my, best.meters),
+		RoadsNear: ix.countRoadsNear(tx, ty, ring, q, best.meters, mpt),
 	}
-	addr.Intersection = ix.nearestIntersection(mx, my, scale)
+	addr.Intersection = ix.nearestIntersection(q, mpt)
 	return addr, nil
 }
 
-// enrichStreetName adopts the name of the closest named road geometry to the
-// snapped point (transportation and transportation_name are separate layers
-// describing the same roads).
-func (ix *Index) enrichStreetName(best *bestMatch, tx, ty, ring int) {
-	const maxSnap = 15.0 // mercator meters
+// nearestRoadName adopts the name/ref of the closest named road geometry to
+// the given point (transportation and transportation_name are separate layers
+// describing the same roads). maxUnits bounds the search in tile units.
+func (ix *Index) nearestRoadName(p geom.XY, maxUnits float64) (string, string) {
 	var name, ref string
-	bestDist := maxSnap
-	for _, t := range ix.tilesInRange(tx, ty, ring) {
+	bestDist := maxUnits
+	for _, t := range ix.tiles {
 		for _, r := range t.roads {
 			if r.name == "" && r.ref == "" {
 				continue
 			}
-			d, p, _, _ := closestOnLineString(best.point.X, best.point.Y, r.line)
-			if d < bestDist && dist(p, best.point) <= maxSnap {
+			d, proj, _, _, _ := closestOnLineString(p.X, p.Y, r.line)
+			if d < bestDist && dist(proj, p) <= maxUnits {
 				name, ref = r.name, r.ref
 				bestDist = d
 			}
 		}
 	}
-	if name != "" || ref != "" {
-		best.road.name = name
-		best.road.ref = ref
-	}
+	return name, ref
 }
 
 func dist(a, b geom.XY) float64 {
 	return math.Hypot(a.X-b.X, a.Y-b.Y)
 }
 
-// loadRing ensures all tiles at chebyshev distance `ring` around (tx,ty) are indexed.
+// nearestIntersection finds the closest junction of 2+ named roads to the
+// query point within ~150m.
+func (ix *Index) nearestIntersection(q geom.XY, mpt float64) *Intersection {
+	const maxDistMeters = 150.0
+	var (
+		best     *node
+		bestDist float64
+	)
+	for _, n := range ix.nodes {
+		if len(n.streets) < 2 {
+			continue
+		}
+		d := math.Hypot(n.x-q.X, n.y-q.Y) * mpt
+		if d <= maxDistMeters && (best == nil || d < bestDist) {
+			best, bestDist = n, d
+		}
+	}
+	if best == nil {
+		return nil
+	}
+	streets := make([]string, 0, len(best.streets))
+	for s := range best.streets {
+		streets = append(streets, s)
+	}
+	sort.Strings(streets)
+	lat, lng := tileLatLng(webMercator(ix.zoom), best.x, best.y)
+	return &Intersection{
+		Lat:      lat,
+		Lng:      lng,
+		Distance: bestDist,
+		Streets:  streets,
+	}
+}
+
+// countRoadsNear counts distinct named roads whose distance is within 2x the
+// best match distance — useful to gauge ambiguity of the position fix.
+func (ix *Index) countRoadsNear(tx, ty, ring int, q geom.XY, bestUnits, mpt float64) int {
+	limit := math.Max(bestUnits*2, bestUnits+100/mpt)
+	names := make(map[string]struct{})
+	for _, t := range ix.tilesInRange(tx, ty, ring) {
+		for _, r := range t.roads {
+			d := distToLineString(q.X, q.Y, r.line)
+			if d <= limit && (r.name != "" || r.ref != "") {
+				key := r.name
+				if key == "" {
+					key = r.ref
+				}
+				names[key] = struct{}{}
+			}
+		}
+	}
+	return len(names)
+}
+
+// loadRing ensures all tiles up to chebyshev distance `ring` around (tx,ty)
+// are indexed. Already-loaded tiles are skipped by loadTile.
 func (ix *Index) loadRing(ctx context.Context, tx, ty, ring int) error {
 	for dx := -ring; dx <= ring; dx++ {
 		for dy := -ring; dy <= ring; dy++ {
-			if maxAbs(dx, dy) != ring {
-				continue // inner rings already loaded
-			}
 			if err := ix.loadTile(ctx, tx+dx, ty+dy); err != nil {
 				return err
 			}
@@ -258,9 +319,6 @@ func (ix *Index) loadTile(ctx context.Context, x, y int) error {
 		return err
 	}
 	td := &tileData{z: ix.zoom, x: wx, y: wy}
-	tileSize := tileSizeMeters(ix.zoom)
-	originX := -maxMercator + float64(wx)*tileSize
-	originY := maxMercator - float64(wy)*tileSize
 	for _, layer := range layers {
 		switch layer.Name {
 		case "transportation", "transportation_name":
@@ -282,18 +340,20 @@ func (ix *Index) loadTile(ctx context.Context, x, y int) error {
 			for i := 0; i < nCoords; i++ {
 				p := seq.GetXY(i)
 				vals = append(vals,
-					originX+p.X/extent*tileSize,
-					originY-p.Y/extent*tileSize,
+					float64(wx)+p.X/extent, // global tile units (carto.WebMercator space)
+					float64(wy)+p.Y/extent,
 				)
 			}
 			if len(vals) < 4 {
 				continue
 			}
 			r := &road{
+				id:       f.ID,
 				name:     asString(f.Properties["name"]),
 				ref:      asString(f.Properties["ref"]),
 				class:    asString(f.Properties["class"]),
 				subclass: asString(f.Properties["subclass"]),
+				oneway:   asBool(f.Properties["oneway"]),
 				line:     geom.NewLineString(geom.NewSequence(vals, geom.DimXY)),
 			}
 			if layer.Name == "transportation_name" && r.class == "" {
@@ -331,59 +391,6 @@ func (ix *Index) indexEndpoints(r *road) {
 	}
 }
 
-// nearestIntersection finds the closest junction of 2+ named roads to the
-// query point within ~150m.
-func (ix *Index) nearestIntersection(mx, my, scale float64) *Intersection {
-	const maxDist = 150.0
-	var (
-		best     *node
-		bestDist float64
-	)
-	for _, n := range ix.nodes {
-		if len(n.streets) < 2 {
-			continue
-		}
-		d := math.Hypot(n.x-mx, n.y-my) * scale
-		if d <= maxDist && (best == nil || d < bestDist) {
-			best, bestDist = n, d
-		}
-	}
-	if best == nil {
-		return nil
-	}
-	streets := make([]string, 0, len(best.streets))
-	for s := range best.streets {
-		streets = append(streets, s)
-	}
-	sort.Strings(streets)
-	return &Intersection{
-		Lat:      mercatorYToLat(best.y),
-		Lng:      mercatorXToLng(best.x),
-		Distance: bestDist,
-		Streets:  streets,
-	}
-}
-
-// countRoadsNear counts distinct named roads whose distance is within 2x the
-// best match distance — useful to gauge ambiguity of the position fix.
-func (ix *Index) countRoadsNear(tx, ty, ring int, mx, my, bestMetersMerc float64) int {
-	limit := math.Max(bestMetersMerc*2, bestMetersMerc+100)
-	names := make(map[string]struct{})
-	for _, t := range ix.tilesInRange(tx, ty, ring) {
-		for _, r := range t.roads {
-			d := distToLineString(mx, my, r.line)
-			if d <= limit && (r.name != "" || r.ref != "") {
-				key := r.name
-				if key == "" {
-					key = r.ref
-				}
-				names[key] = struct{}{}
-			}
-		}
-	}
-	return len(names)
-}
-
 // roadsInRing returns roads from tiles in rings 0..ring (deduplicated).
 func (ix *Index) roadsInRing(tx, ty, ring int) []*road {
 	var roads []*road
@@ -410,6 +417,13 @@ func (ix *Index) tilesInRange(tx, ty, ring int) []*tileData {
 	return out
 }
 
+func validateLatLng(lat, lng float64) error {
+	if lat < -85.05112878 || lat > 85.05112878 || lng < -180 || lng >= 180 {
+		return fmt.Errorf("lat/lng out of range: %f,%f", lat, lng)
+	}
+	return nil
+}
+
 func tileID(z, x, y int) uint64 {
 	return uint64(z)<<40 | uint64(uint32(x))<<20 | uint64(uint32(y))
 }
@@ -418,21 +432,8 @@ func wrap(v, n int) int {
 	return ((v % n) + n) % n
 }
 
-func maxAbs(a, b int) int {
-	if a < 0 {
-		a = -a
-	}
-	if b < 0 {
-		b = -b
-	}
-	if a > b {
-		return a
-	}
-	return b
-}
-
 func nodeKey(p geom.XY) string {
-	// Quantize to ~1 meter to tolerate duplicate encoding across tiles.
+	// Quantize to ~1 tile unit to tolerate duplicate encoding across layers.
 	return strconv.FormatInt(int64(math.Round(p.X)), 10) + ":" +
 		strconv.FormatInt(int64(math.Round(p.Y)), 10)
 }
@@ -442,15 +443,14 @@ func asString(v any) string {
 	return strings.TrimSpace(s)
 }
 
-func bearingDeg(start, end geom.XY) float64 {
-	dx := end.X - start.X
-	dy := end.Y - start.Y
-	if dx == 0 && dy == 0 {
-		return 0
+func asBool(v any) bool {
+	switch t := v.(type) {
+	case bool:
+		return t
+	case int64:
+		return t != 0
+	case string:
+		return t == "yes" || t == "true" || t == "1"
 	}
-	b := math.Atan2(dx, dy) / degToRad
-	if b < 0 {
-		b += 360
-	}
-	return b
+	return false
 }

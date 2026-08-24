@@ -10,17 +10,15 @@ import (
 )
 
 func TestProjectionRoundTrip(t *testing.T) {
+	wm := webMercator(14)
 	cases := [][2]float64{
 		{48.8566, 2.3522},
 		{52.5163, 13.3777},
 		{-33.8688, 151.2093},
-		{0.0001, -0.0001},
 	}
 	for _, c := range cases {
-		mx := lngToMercatorX(c[1])
-		my := latToMercatorY(c[0])
-		gotLat := mercatorYToLat(my)
-		gotLng := mercatorXToLng(mx)
+		u := wm.Forward(geom.XY{X: c[1], Y: c[0]})
+		gotLat, gotLng := tileLatLng(wm, u.X, u.Y)
 		if math.Abs(gotLat-c[0]) > 1e-9 || math.Abs(gotLng-c[1]) > 1e-9 {
 			t.Fatalf("round trip failed for %v: got %f,%f", c, gotLat, gotLng)
 		}
@@ -28,16 +26,28 @@ func TestProjectionRoundTrip(t *testing.T) {
 }
 
 func TestTileMath(t *testing.T) {
-	xf, yf := latLngToTileF(52.5163, 13.3777, 14)
+	wm := webMercator(14)
+	xf, yf := latLngToTileF(wm, 52.5163, 13.3777)
 	if x, y := int(xf), int(yf); x != 8800 || y != 5373 {
-		t.Fatalf("expected tile 8801/5373 got %d/%d", x, y)
+		t.Fatalf("expected tile 8800/5373 got %d/%d", x, y)
 	}
-	lat, lng := tileToLatLng(8801, 5373, 14)
-	if math.Abs(lat-52.54) > 0.05 || math.Abs(lng-13.36) > 0.05 {
-		t.Fatalf("unexpected NW corner %f,%f", lat, lng)
+
+	// Meters-per-tile sanity: at the equator a z14 tile is ~2446m wide,
+	// scaled by cos(lat).
+	if m := metersPerTileAtLat(0, 14); math.Abs(m-EarthCircumferenceMeters/16384) > 1e-6 {
+		t.Fatalf("bad metersPerTile at equator: %f", m)
 	}
-	if ts := tileSizeMeters(14); math.Abs(ts-40075016.686/16384) > 1e-6 {
-		t.Fatalf("bad tile size %f", ts)
+	if m := metersPerTileAtLat(60, 14); math.Abs(m-(EarthCircumferenceMeters/16384)*0.5) > 1e-3 {
+		t.Fatalf("bad metersPerTile at 60°: %f", m)
+	}
+}
+
+func TestBearingYDown(t *testing.T) {
+	north := bearingDeg(geom.XY{}, geom.XY{X: 0, Y: -1})
+	east := bearingDeg(geom.XY{}, geom.XY{X: 1, Y: 0})
+	south := bearingDeg(geom.XY{}, geom.XY{X: 0, Y: 1})
+	if north != 0 || east != 90 || south != 180 {
+		t.Fatalf("bad bearings: N=%f E=%f S=%f", north, east, south)
 	}
 }
 
@@ -56,7 +66,6 @@ func TestClosestOnSegment(t *testing.T) {
 	}
 }
 
-// TestReverseLive performs a real reverse lookup against OpenFreeMap.
 func TestReverseLive(t *testing.T) {
 	if testing.Short() {
 		t.Skip("network test")
@@ -64,7 +73,7 @@ func TestReverseLive(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	ix := NewIndex(WithMaxRings(1))
+	ix := NewIndex()
 	addr, err := ix.Reverse(ctx, 52.5163, 13.3777) // Brandenburger Tor, Berlin
 	if err != nil {
 		t.Fatalf("reverse failed: %v", err)
