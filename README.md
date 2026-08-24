@@ -1,6 +1,6 @@
 # ouca
 
-Reverse geocoding and map matching library for Go:
+Cheap reverse geocoding and map matching library for Go, it uses public map tiles as a data source.
 
 - **`Reverse`** — given a latitude/longitude, returns the closest street, its
   distance and bearing from the query point, and the nearest road intersection.
@@ -66,6 +66,10 @@ for the given trace without windowing heuristics.
    endpoints), not just the nearest vertex; candidates carry the road's
    feature ID, name, class, one-way flag and the snapped vertex index.
    Candidates are ranked by emission cost and truncated to the top 32.
+   Multi-part geometries are split into one road per connected part, and
+   features from layers with unusable ids (the `transportation` layer emits
+   the same id for every feature) get synthetic unique ids, so feature
+   identity — and with it the turn/gap logic — stays reliable.
 3. **Emission cost** — negative log-likelihood of a Gaussian centered on the
    candidate:
    `0.5 · (distance / σ)² + classPenalty`
@@ -85,7 +89,9 @@ for the given trace without windowing heuristics.
    recovered by backpointers. Consecutive snaps on the same road are expanded
    along the real geometry; snaps on connected roads are bridged through the
    shared junction; unbridgeable pairs keep a minimal straight connector so
-   no spikes are ever emitted.
+   no spikes are ever emitted. Finally, out-and-back excursions (the path
+   briefly entering a side road and returning to a visited point) are
+   spliced out, keeping the emitted geometry monotonic.
 
 **Graceful degradation:** if the vehicle enters a tunnel or private lot and
 no road data exists within the search radius, a "virtual road" candidate is
