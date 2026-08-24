@@ -72,7 +72,14 @@ type road struct {
 	class    string
 	subclass string
 	oneway   bool
-	line     geom.LineString
+	// onewayTagged reports whether the MVT feature carried an explicit
+	// oneway attribute (absent means unknown, not two-way).
+	onewayTagged bool
+	// onewayFlip marks roads whose one-way restriction was inherited from
+	// an overlapping fragment whose geometry runs opposite to this line's
+	// vertex order.
+	onewayFlip bool
+	line       geom.LineString
 }
 
 type node struct {
@@ -398,6 +405,9 @@ func (ix *Index) loadTile(ctx context.Context, x, y int) error {
 					oneway:   asBool(f.Properties["oneway"]),
 					line:     geom.NewLineString(geom.NewSequence(vals, geom.DimXY)),
 				}
+				if _, ok := f.Properties["oneway"]; ok {
+					r.onewayTagged = true
+				}
 				// Feature ids from the transportation layer are unusable:
 				// the provider emits the same id for every feature, which
 				// would make unrelated roads look identical to the matcher.
@@ -417,7 +427,58 @@ func (ix *Index) loadTile(ctx context.Context, x, y int) error {
 		}
 	}
 	ix.tiles[key] = td
+	inheritOneway(td.roads)
 	return nil
+}
+
+// onewayJoinUnits is how close (in tile units, ~2.5 ground meters) a road
+// segment midpoint must lie to an explicitly one-way-tagged geometry for the
+// restriction to be adopted.
+const onewayJoinUnits = 5.0
+
+// inheritOneway copies one-way restrictions onto roads whose MVT feature
+// lacks the oneway attribute. Some providers (e.g. OpenFreeMap/tilemaker)
+// split each OSM way into fragments and emit direction attributes only on
+// unnamed fragments, while the named fragment of the same street carries no
+// oneway tag at all. Restrictions are joined back by geometry overlap within
+// a tight tolerance; flip records when the tagged fragment runs opposite to
+// the target's vertex order so wrong-way detection can compensate.
+func inheritOneway(roads []*road) {
+	var tagged []*road
+	for _, r := range roads {
+		if r.onewayTagged && r.oneway {
+			tagged = append(tagged, r)
+		}
+	}
+	if len(tagged) == 0 {
+		return
+	}
+	for _, r := range roads {
+		if r.onewayTagged {
+			continue
+		}
+		seq := r.line.Coordinates()
+		bestDist := math.MaxFloat64
+		flip := false
+		for i := 0; i+1 < seq.Length(); i++ {
+			a, b := seq.GetXY(i), seq.GetXY(i+1)
+			mid := geom.XY{X: (a.X + b.X) / 2, Y: (a.Y + b.Y) / 2}
+			for _, s := range tagged {
+				if s.class != r.class {
+					continue // avoid joining across parallel twins (sidewalks, cycleways)
+				}
+				d, _, sa, sb, _ := closestOnLineString(mid.X, mid.Y, s.line)
+				if d < bestDist {
+					bestDist = d
+					flip = sb.Sub(sa).Dot(b.Sub(a)) < 0
+				}
+			}
+		}
+		if bestDist <= onewayJoinUnits {
+			r.oneway = true
+			r.onewayFlip = flip
+		}
+	}
 }
 
 // indexEndpoints records both ends of a named road as potential intersections.

@@ -111,10 +111,84 @@ func TestMatchPathFollowsRoad(t *testing.T) {
 	}
 }
 
+// TestInheritOnewayFromFragments mirrors providers like OpenFreeMap that
+// emit direction attributes only on unnamed geometry fragments of a way:
+// the named fragment must adopt the restriction, including its orientation
+// relative to its own vertex order.
+func TestInheritOnewayFromFragments(t *testing.T) {
+	const (
+		tx, ty = 8800.0, 5373.0
+	)
+	mkLine := func(vals []float64) geom.LineString {
+		return geom.NewLineString(geom.NewSequence(vals, geom.DimXY))
+	}
+	// Named fragment without a oneway attribute; unnamed tagged fragments
+	// overlapping it, one aligned and one reversed.
+	named := &road{id: 1, name: "One Way Ave", class: "secondary",
+		line: mkLine([]float64{tx + 0.5, ty, tx + 0.5, ty + 1})}
+	fragAligned := &road{id: 2, class: "secondary", oneway: true, onewayTagged: true,
+		line: mkLine([]float64{tx + 0.5, ty + 0.3, tx + 0.5, ty + 0.6})}
+	fragReversed := &road{id: 3, class: "secondary", oneway: true, onewayTagged: true,
+		line: mkLine([]float64{tx + 0.5, ty + 0.7, tx + 0.5, ty + 0.4})}
+
+	inheritOneway([]*road{named, fragAligned})
+	if !named.oneway {
+		t.Fatal("named road did not inherit oneway from overlapping fragment")
+	}
+	if named.onewayFlip {
+		t.Fatal("flip set for aligned fragment")
+	}
+
+	named2 := &road{id: 4, name: "One Way Ave", class: "secondary",
+		line: mkLine([]float64{tx + 0.5, ty, tx + 0.5, ty + 1})}
+	inheritOneway([]*road{named2, fragReversed})
+	if !named2.oneway || !named2.onewayFlip {
+		t.Fatalf("expected inherited flipped oneway, got oneway=%v flip=%v",
+			named2.oneway, named2.onewayFlip)
+	}
+}
+
+// TestTransitionCostWrongWay checks that traveling against an inherited,
+// flipped one-way restriction is penalized.
+func TestTransitionCostWrongWay(t *testing.T) {
+	opts := DefaultPathOptions("car")
+	base := candidate{
+		point:     geom.XY{X: 8800.5, Y: 5373.5},
+		roadRef:   &road{},
+		featureID: 1,
+		name:      "One Way Ave",
+	}
+	prev := base
+
+	// GPS step northbound along the segment.
+	diffGps := geom.XY{X: 0, Y: -0.001}
+	withOneway := base
+	withOneway.oneway = true
+	withOneway.segDir = geom.XY{X: 0, Y: -1} // encoded northbound (Y grows south)
+	c := transitionCost(prev, withOneway, diffGps, 10, 1500, &opts)
+	plain := transitionCost(prev, base, diffGps, 10, 1500, &opts)
+	if c-plain > 1 {
+		t.Fatalf("legal direction unexpectedly penalized: %f vs %f", c, plain)
+	}
+
+	// Same step but the restriction was inherited from a reversed fragment.
+	flipped := withOneway
+	flipped.onewayFlip = true
+	c = transitionCost(prev, flipped, diffGps, 10, 1500, &opts)
+	if c-plain < opts.WrongWayPenalty/2 {
+		t.Fatalf("wrong-way travel not penalized when flipped: %f vs %f", c, plain)
+	}
+}
+
 func TestClassPenalties(t *testing.T) {
 	car := ClassPenalties("car")
 	if car["footway"] != 100 || car["primary"] != 0 {
 		t.Fatal("unexpected car penalties")
+	}
+	// Rail-like classes must be near-excluded for cars: their geometries
+	// often parallel roads (subway under a street) and win on proximity.
+	if car["transit"] != 100 || car["rail"] != 100 {
+		t.Fatal("rail-like classes not penalized for cars")
 	}
 	walk := ClassPenalties("walk")
 	if walk["footway"] != 0 || walk["motorway"] != 100 {

@@ -68,6 +68,9 @@ func ClassPenalties(mode string) map[string]float64 {
 		penalties["residential"] = 1.0
 		penalties["primary"] = 5.0
 		penalties["secondary"] = 5.0
+		penalties["rail"] = 100.0
+		penalties["transit"] = 100.0
+		penalties["aerialway"] = 100.0
 	case "bike":
 		penalties["motorway"] = 100.0
 		penalties["trunk"] = 50.0
@@ -79,6 +82,9 @@ func ClassPenalties(mode string) map[string]float64 {
 		penalties["residential"] = 1.0
 		penalties["primary"] = 3.0
 		penalties["secondary"] = 2.0
+		penalties["rail"] = 100.0
+		penalties["transit"] = 100.0
+		penalties["aerialway"] = 100.0
 	default: // car
 		penalties["path"] = 100.0
 		penalties["footway"] = 100.0
@@ -97,6 +103,12 @@ func ClassPenalties(mode string) map[string]float64 {
 		penalties["tertiary"] = 0.0
 		penalties["motorway"] = 0.0
 		penalties["trunk"] = 0.0
+		// Rail-like geometries often parallel roads (e.g. subway lines
+		// under a street) and would otherwise win on raw proximity.
+		penalties["rail"] = 100.0
+		penalties["transit"] = 100.0
+		penalties["aerialway"] = 100.0
+		penalties["ferry"] = 50.0
 	}
 	return penalties
 }
@@ -353,6 +365,7 @@ type candidate struct {
 	classScore float64
 	segDir     geom.XY // direction of the matched segment
 	oneway     bool
+	onewayFlip bool
 	seq        geom.Sequence
 	snapIdx    int
 }
@@ -393,10 +406,17 @@ func transitionCost(prev, curr candidate, diffGps geom.XY, gpsMeters, mpt float6
 
 	// One-way awareness for cars.
 	if curr.oneway {
+		// Effective allowed direction: the segment's vertex order, reversed
+		// when the restriction was inherited from an opposite-running
+		// fragment.
+		dir := curr.segDir
+		if curr.onewayFlip {
+			dir = geom.XY{X: -dir.X, Y: -dir.Y}
+		}
 		lenSqGps := diffGps.Dot(diffGps)
-		lenSqSeg := curr.segDir.Dot(curr.segDir)
+		lenSqSeg := dir.Dot(dir)
 		if lenSqGps > 0 && lenSqSeg > 0 {
-			cosTheta := diffGps.Dot(curr.segDir) / math.Sqrt(lenSqGps*lenSqSeg)
+			cosTheta := diffGps.Dot(dir) / math.Sqrt(lenSqGps*lenSqSeg)
 			if cosTheta < 0 && gpsMeters > 2.0 {
 				cost += opts.WrongWayPenalty
 			}
@@ -467,6 +487,7 @@ func (ix *Index) candidatesForPoint(gps geom.XY, lat, radiusMeters, mpt float64,
 			classScore: classPenalty(penalties, mode, r.class),
 			segDir:     segB.Sub(segA),
 			oneway:     mode == "car" && r.oneway,
+			onewayFlip: r.onewayFlip,
 			seq:        r.line.Coordinates(),
 			snapIdx:    snapIdx,
 		})
