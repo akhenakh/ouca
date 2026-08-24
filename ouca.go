@@ -51,6 +51,8 @@ type Index struct {
 	client  *tileClient
 	maxRing int
 
+	nextID uint64 // synthetic feature ids for layers with unusable ids
+
 	mu       sync.Mutex
 	resolved bool
 	tiles    map[uint64]*tileData
@@ -136,6 +138,7 @@ func NewIndex(opts ...Option) *Index {
 		zoom:    DefaultZoom,
 		client:  newTileClient(DefaultProvider, 30*time.Second),
 		maxRing: 1,
+		nextID:  1 << 62, // well above any real OSM way id
 		tiles:   make(map[uint64]*tileData),
 		nodes:   make(map[string]*node),
 	}
@@ -350,36 +353,67 @@ func (ix *Index) loadTile(ctx context.Context, x, y int) error {
 		}
 		for _, f := range layer.Features {
 			g := f.Geometry
-			if !g.IsLineString() && !g.IsMultiLineString() {
+			// A feature may contain several disjoint parts (e.g. a road
+			// clipped by the tile border); keep them as separate roads so
+			// sequences never jump between parts.
+			var lines []geom.LineString
+			switch {
+			case g.IsLineString():
+				ls, ok := g.AsLineString()
+				if !ok {
+					continue
+				}
+				lines = append(lines, ls)
+			case g.IsMultiLineString():
+				ml, ok := g.AsMultiLineString()
+				if !ok {
+					continue
+				}
+				for i := 0; i < ml.NumLineStrings(); i++ {
+					lines = append(lines, ml.LineStringN(i))
+				}
+			default:
 				continue
 			}
-			seq := g.DumpCoordinates()
-			nCoords := seq.Length()
-			vals := make([]float64, 0, nCoords*2)
-			for i := 0; i < nCoords; i++ {
-				p := seq.GetXY(i)
-				vals = append(vals,
-					float64(wx)+p.X/extent, // global tile units (carto.WebMercator space)
-					float64(wy)+p.Y/extent,
-				)
+			for _, line := range lines {
+				seq := line.Coordinates()
+				nCoords := seq.Length()
+				vals := make([]float64, 0, nCoords*2)
+				for i := 0; i < nCoords; i++ {
+					p := seq.GetXY(i)
+					vals = append(vals,
+						float64(wx)+p.X/extent, // global tile units (carto.WebMercator space)
+						float64(wy)+p.Y/extent,
+					)
+				}
+				if len(vals) < 4 {
+					continue
+				}
+				r := &road{
+					id:       f.ID,
+					name:     asString(f.Properties["name"]),
+					ref:      asString(f.Properties["ref"]),
+					class:    asString(f.Properties["class"]),
+					subclass: asString(f.Properties["subclass"]),
+					oneway:   asBool(f.Properties["oneway"]),
+					line:     geom.NewLineString(geom.NewSequence(vals, geom.DimXY)),
+				}
+				// Feature ids from the transportation layer are unusable:
+				// the provider emits the same id for every feature, which
+				// would make unrelated roads look identical to the matcher.
+				// Assign synthetic unique ids for that layer (and for any
+				// feature without an id); transportation_name carries real,
+				// stable OSM way ids.
+				if layer.Name != "transportation_name" || r.id == 0 {
+					r.id = ix.nextID
+					ix.nextID++
+				}
+				if layer.Name == "transportation_name" && r.class == "" {
+					r.class = "road"
+				}
+				td.roads = append(td.roads, r)
+				ix.indexEndpoints(r)
 			}
-			if len(vals) < 4 {
-				continue
-			}
-			r := &road{
-				id:       f.ID,
-				name:     asString(f.Properties["name"]),
-				ref:      asString(f.Properties["ref"]),
-				class:    asString(f.Properties["class"]),
-				subclass: asString(f.Properties["subclass"]),
-				oneway:   asBool(f.Properties["oneway"]),
-				line:     geom.NewLineString(geom.NewSequence(vals, geom.DimXY)),
-			}
-			if layer.Name == "transportation_name" && r.class == "" {
-				r.class = "road"
-			}
-			td.roads = append(td.roads, r)
-			ix.indexEndpoints(r)
 		}
 	}
 	ix.tiles[key] = td

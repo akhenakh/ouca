@@ -260,6 +260,7 @@ func (ix *Index) MatchPath(ctx context.Context, trace []LatLng, opts *PathOption
 		}
 		unitsPath = append(unitsPath, c.point)
 	}
+	unitsPath = removeSpurs(unitsPath)
 
 	match := &PathMatch{Points: make([]SnappedPoint, n)}
 	last := geom.XY{}
@@ -301,6 +302,41 @@ func (ix *Index) MatchPath(ctx context.Context, trace []LatLng, opts *PathOption
 }
 
 var errTraceTooShort = &traceError{"trace must contain at least 2 points"}
+
+// removeSpurs drops out-and-back excursions from a path: when the path
+// returns to a previously visited point (within tol), the excursion in
+// between is spliced out provided it is short. Such excursions appear when
+// the matcher briefly snaps onto a side road and comes back.
+func removeSpurs(path []geom.XY) []geom.XY {
+	const (
+		tol     = 0.004 // ~6m in tile units
+		maxSpur = 0.045 // ~70m excursion length in tile units
+	)
+	for changed := true; changed; {
+		changed = false
+		for i := 0; i < len(path); i++ {
+			for j := i + 2; j < len(path); j++ {
+				if dist(path[i], path[j]) > tol {
+					continue
+				}
+				excursion := 0.0
+				for k := i; k < j; k++ {
+					excursion += dist(path[k], path[k+1])
+				}
+				if excursion > maxSpur {
+					continue
+				}
+				path = append(path[:i+1], path[j:]...)
+				changed = true
+				break
+			}
+			if changed {
+				break
+			}
+		}
+	}
+	return path
+}
 
 type traceError struct{ msg string }
 
